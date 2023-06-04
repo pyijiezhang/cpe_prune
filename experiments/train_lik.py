@@ -96,7 +96,7 @@ def test_bma(net, data_loader, samples_dir, nll_criterion=None, device=None):
 
 
 @torch.no_grad()
-def get_log_p(data_loader, net, device=None):
+def get_metrics_sample(net, data_loader, device=None):
     net.eval()
 
     all_logits = []
@@ -108,8 +108,52 @@ def get_log_p(data_loader, net, device=None):
         all_Y.append(Y)
     all_logits = torch.cat(all_logits)
     all_Y = torch.cat(all_Y)
+
     log_p = torch.distributions.Categorical(logits=all_logits).log_prob(all_Y)
-    return log_p
+    Y_pred = all_logits.softmax(dim=-1).argmax(dim=-1)
+    acc = (Y_pred == all_Y).sum().item() / Y_pred.size(0)
+    return log_p, acc
+
+
+@torch.no_grad()
+def get_metrics_bma(net, data_loader, samples_dir, device=None):
+    net.eval()
+
+    ens_logits = []
+    for sample_path in tqdm(Path(samples_dir).rglob("*.pt"), leave=False):
+        net.load_state_dict(torch.load(sample_path))
+
+        all_logits = []
+        all_Y = []
+        for X, Y in tqdm(data_loader, leave=False):
+            X, Y = X.to(device), Y.to(device)
+            _logits = net(X)
+            all_logits.append(_logits)
+            all_Y.append(Y)
+        all_logits = torch.cat(all_logits)
+        all_Y = torch.cat(all_Y)
+
+        ens_logits.append(all_logits)
+
+    ens_logits = torch.stack(ens_logits)
+
+    log_p = torch.distributions.Categorical(logits=ens_logits).log_prob(all_Y)
+    gibbs_loss = -log_p.mean()
+    bayes_loss = (
+        torch.log(torch.tensor(log_p.shape[0])) - torch.logsumexp(log_p, 0)
+    ).mean()
+    Y_pred = ens_logits.softmax(dim=-1).mean(dim=0).argmax(dim=-1)
+    acc = (Y_pred == all_Y).sum().item() / Y_pred.size(0)
+
+    return {"acc": acc, "gibbs_loss": gibbs_loss, "bayes_loss": bayes_loss}
+
+
+@torch.no_grad()
+def get_mean_abs_weights(net):
+    mean_abs_weights = 0
+    for param in net.parameters():
+        mean_abs_weights += torch.abs(param).mean().item()
+    return mean_abs_weights
 
 
 def run_sgd(
@@ -249,7 +293,6 @@ def run_csgld(
     net,
     criterion,
     samples_dir,
-    log_p_dir,
     device=None,
     lr=1e-2,
     momentum=0.9,
@@ -288,21 +331,42 @@ def run_csgld(
                     torch.save(net.state_dict(), samples_dir / f"s_e{e}_m{i}.pt")
                     wandb.save("samples/*.pt")
 
-                    log_p_train = get_log_p(train_loader, net, device=device)
-                    log_p_test = get_log_p(test_loader, net, device=device)
-                    torch.save(log_p_train, log_p_dir / f"log_p_train_e{e}.pt")
-                    torch.save(log_p_test, log_p_dir / f"log_p_test_e{e}.pt")
+                    bma_metrics_test = get_metrics_bma(
+                        net, test_loader, samples_dir, device=device
+                    )
+
+                    wandb.log(
+                        {f"sgld/test/bma_{k}": v for k, v in bma_metrics_test.items()},
+                        step=e,
+                    )
+
+                    logging.info(
+                        f"sgld bma test nll (epoch {e}): {bma_metrics_test['bayes_loss']:.4f}"
+                    )
 
             sgld_scheduler.step()
 
-        if not sgld_scheduler.should_sample():
-            log_p_test = get_log_p(test_loader, net, device=device)
+        log_p_test, acc_test = get_metrics_sample(net, test_loader, device=device)
         nll_test = -log_p_test.mean().numpy()
+        mean_abs_weights = get_mean_abs_weights(net)
 
-        logging.info(f"cSGLD (Epoch {e}) : test nll {nll_test:.4f}")
+        wandb.log({f"sgld/test/sample_nll": nll_test}, step=e)
+        wandb.log({f"sgld/test/sample_acc": acc_test}, step=e)
+        wandb.log({f"sgld/sample_mean_abs_weights": mean_abs_weights}, step=e)
+
+        logging.info(
+            f"sgld (epoch {e}) : test nll {nll_test:.4f}, test acc {acc_test:.4f}"
+        )
+
+    bma_metrics_test = get_metrics_bma(net, test_loader, samples_dir, device=device)
+
+    wandb.log({f"sgld/test/bma_{k}": v for k, v in bma_metrics_test.items()})
+    logging.info(f"sgld bma test nll (epoch {e}): {bma_metrics_test['bayes_loss']:.4f}")
 
 
 def main(
+    project_name=None,
+    wandb_mode=None,
     seed=None,
     device=0,
     data_dir=None,
@@ -337,7 +401,12 @@ def main(
     set_seeds(seed)
     device = f"cuda:{device}" if (device >= 0 and torch.cuda.is_available()) else "cpu"
 
+    run_name = f"{dataset}_{dirty_lik}_{temperature}_{likelihood_temp}_{augment}_{prior_scale}_{logits_temp}_{label_noise}_{likelihood}_{seed}"
+
     wandb.init(
+        project=project_name,
+        name=f"{run_name}",
+        mode=wandb_mode,
         config={
             "seed": seed,
             "dataset": dataset,
@@ -347,20 +416,18 @@ def main(
             "augment": augment,
             "dirty_lik": dirty_lik,
             "temperature": temperature,
+            "label_noise": label_noise,
             "burn_in": burn_in,
             "sgld_lr": sgld_lr,
             "dir_noise": noise,
             "likelihood": likelihood,
             "likelihood_T": likelihood_temp,
             "logits_temp": logits_temp,
-        }
+        },
     )
 
     samples_dir = Path(wandb.run.dir) / "samples"
     samples_dir.mkdir()
-
-    log_p_dir = Path(wandb.run.dir) / "log_p"
-    log_p_dir.mkdir()
 
     if dataset == "tiny-imagenet":
         train_data, test_data = get_tiny_imagenet(
@@ -445,7 +512,6 @@ def main(
                 net,
                 criterion,
                 samples_dir,
-                log_p_dir,
                 device=device,
                 lr=sgld_lr,
                 momentum=momentum,
@@ -471,6 +537,14 @@ def main(
                 epochs=sgld_epochs,
                 nll_criterion=nll_criterion,
             )
+
+    wandb.alert(
+        title=f"run_{run_name} finishes!",
+        text=f"run_{run_name} finishes!",
+        level=wandb.AlertLevel.WARN,
+    )
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
