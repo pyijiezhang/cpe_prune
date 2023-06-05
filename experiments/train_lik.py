@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from data_aug.optim import SGLD
 from data_aug.optim.lr_scheduler import CosineLR
 from data_aug.utils import set_seeds
-from data_aug.models import ResNet18, ResNet18FRN, ResNet18Fixup, LeNet
+from data_aug.models import ResNet18, ResNet18FRN, ResNet18Fixup, LeNetBig, LeNetSmall
 from data_aug.datasets import (
     get_cifar10,
     get_tiny_imagenet,
@@ -96,7 +96,7 @@ def test_bma(net, data_loader, samples_dir, nll_criterion=None, device=None):
 
 
 @torch.no_grad()
-def get_metrics_sample(net, data_loader, device=None):
+def get_metrics_training(net, data_loader, device=None):
     net.eval()
 
     all_logits = []
@@ -146,14 +146,6 @@ def get_metrics_bma(net, data_loader, samples_dir, device=None):
     acc = (Y_pred == all_Y).sum().item() / Y_pred.size(0)
 
     return {"acc": acc, "gibbs_loss": gibbs_loss, "bayes_loss": bayes_loss}
-
-
-@torch.no_grad()
-def get_mean_abs_weights(net):
-    mean_abs_weights = 0
-    for param in net.parameters():
-        mean_abs_weights += torch.abs(param).mean().item()
-    return mean_abs_weights
 
 
 def run_sgd(
@@ -346,26 +338,28 @@ def run_csgld(
 
             sgld_scheduler.step()
 
-        log_p_test, acc_test = get_metrics_sample(net, test_loader, device=device)
-        nll_test = -log_p_test.mean().numpy()
-        mean_abs_weights = get_mean_abs_weights(net)
+        log_p_test, acc_test = get_metrics_training(net, test_loader, device=device)
+        nll_test = -log_p_test.mean().item()
 
-        wandb.log({f"sgld/test/sample_nll": nll_test}, step=e)
-        wandb.log({f"sgld/test/sample_acc": acc_test}, step=e)
-        wandb.log({f"sgld/sample_mean_abs_weights": mean_abs_weights}, step=e)
+        wandb.log({f"sgld/test/nll": nll_test}, step=e)
+        wandb.log({f"sgld/test/acc": acc_test}, step=e)
 
         logging.info(
             f"sgld (epoch {e}) : test nll {nll_test:.4f}, test acc {acc_test:.4f}"
         )
 
     bma_metrics_test = get_metrics_bma(net, test_loader, samples_dir, device=device)
-
     wandb.log({f"sgld/test/bma_{k}": v for k, v in bma_metrics_test.items()})
     logging.info(f"sgld bma test nll (epoch {e}): {bma_metrics_test['bayes_loss']:.4f}")
 
+    bma_metrics_train = get_metrics_bma(net, train_loader, samples_dir, device=device)
+    wandb.log({f"sgld/train/bma_{k}": v for k, v in bma_metrics_train.items()})
+    logging.info(
+        f"sgld bma train nll (epoch {e}): {bma_metrics_train['bayes_loss']:.4f}"
+    )
+
 
 def main(
-    project_name=None,
     wandb_mode=None,
     seed=None,
     device=0,
@@ -404,7 +398,7 @@ def main(
     run_name = f"{dataset}_{dirty_lik}_{temperature}_{likelihood_temp}_{augment}_{prior_scale}_{logits_temp}_{label_noise}_{likelihood}_{seed}"
 
     wandb.init(
-        project=project_name,
+        project=f"{dataset}_{dirty_lik}",
         name=f"{run_name}",
         mode=wandb_mode,
         config={
@@ -458,8 +452,10 @@ def main(
         net = ResNet18FRN(num_classes=train_data.total_classes).to(device)
     elif dirty_lik == "fixup":
         net = ResNet18Fixup(num_classes=train_data.total_classes).to(device)
-    elif dirty_lik == "lenet":
-        net = LeNet(num_classes=train_data.total_classes).to(device)
+    elif dirty_lik == "lenetbig":
+        net = LeNetBig(num_classes=train_data.total_classes).to(device)
+    elif dirty_lik == "lenetsmall":
+        net = LeNetSmall(num_classes=train_data.total_classes).to(device)
     # print(net)
 
     net = net.to(device)

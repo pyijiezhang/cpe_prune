@@ -1,4 +1,4 @@
-name: cpe_prune
+name: cpe
 channels:
   - conda-forge
   - anaconda
